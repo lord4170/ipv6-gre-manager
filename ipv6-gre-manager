@@ -1,0 +1,1101 @@
+#!/usr/bin/env bash
+# IPv6 GRE Tunnel Manager - v1.0.3
+# Supports standalone Foreign and Iran servers. No default-route, NAT or forwarding changes.
+set -Eeuo pipefail
+
+APP_NAME="IPv6 GRE Tunnel Manager"
+VERSION="1.0.3"
+BASE_DIR="/etc/ipv6-gre-manager"
+CONFIG_DIR="$BASE_DIR/tunnels"
+ROLE_FILE="$BASE_DIR/role"
+EXPORT_DIR="/var/lib/ipv6-gre-manager/exports"
+CRYPTO_HELPER="/usr/local/libexec/ipv6-gre-manager/gre-link-crypto.py"
+DEFAULT_POOL="10.250.0.0/16"
+DEFAULT_TTL="255"
+SERVICE_PREFIX="ipv6-gre@"
+
+C_VERSION=""
+C_NAME=""
+C_ROLE=""
+C_LOCAL_IPV6=""
+C_REMOTE_IPV6=""
+C_LOCAL_IPV4=""
+C_REMOTE_IPV4=""
+C_PREFIX="30"
+C_TTL="$DEFAULT_TTL"
+C_MTU="1456"
+
+if [[ -t 1 && "${TERM:-dumb}" != "dumb" && -z "${NO_COLOR:-}" ]]; then
+  RED=$'\033[31m'
+  GREEN=$'\033[32m'
+  YELLOW=$'\033[33m'
+  BLUE=$'\033[34m'
+  MAGENTA=$'\033[35m'
+  CYAN=$'\033[36m'
+  WHITE=$'\033[97m'
+  BOLD=$'\033[1m'
+  DIM=$'\033[2m'
+  RESET=$'\033[0m'
+else
+  RED=''; GREEN=''; YELLOW=''; BLUE=''; MAGENTA=''; CYAN=''; WHITE=''; BOLD=''; DIM=''; RESET=''
+fi
+
+info() { printf "%b[INFO]%b %s\n" "$CYAN" "$RESET" "$*"; }
+ok() { printf "%b[ OK ]%b %s\n" "$GREEN" "$RESET" "$*"; }
+warn() { printf "%b[WARN]%b %s\n" "$YELLOW" "$RESET" "$*"; }
+err() { printf "%b[ERR ]%b %s\n" "$RED" "$RESET" "$*" >&2; }
+die() { err "$*"; return 1; }
+
+require_root() {
+  if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+    die "Run this command as root. Example: sudo ipv6-gre-manager" || exit 1
+  fi
+}
+
+ensure_dirs() {
+  install -d -m 0700 "$BASE_DIR" "$CONFIG_DIR" "$EXPORT_DIR"
+}
+
+require_commands() {
+  local missing=() cmd
+  for cmd in ip ping python3 systemctl openssl; do
+    command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
+  done
+  if ((${#missing[@]})); then
+    die "Missing required tools: ${missing[*]}. Run install.sh first." || exit 1
+  fi
+}
+
+valid_name() {
+  [[ "$1" =~ ^[a-zA-Z][a-zA-Z0-9_-]{0,14}$ ]]
+}
+
+valid_ipv6() {
+  python3 - "$1" <<'PY' >/dev/null 2>&1
+import ipaddress, sys
+try:
+    a = ipaddress.IPv6Address(sys.argv[1])
+    if a.is_unspecified or a.is_loopback or a.is_multicast or a.is_link_local:
+        raise ValueError()
+except Exception:
+    sys.exit(1)
+sys.exit(0)
+PY
+}
+
+valid_ipv4_pair() {
+  python3 - "$1" "$2" "$3" <<'PY' >/dev/null 2>&1
+import ipaddress, sys
+try:
+    a = ipaddress.IPv4Interface(sys.argv[1] + '/' + sys.argv[3])
+    b = ipaddress.IPv4Interface(sys.argv[2] + '/' + sys.argv[3])
+    if a.network != b.network or a.ip == b.ip:
+        raise ValueError()
+    if a.ip in (a.network.network_address, a.network.broadcast_address):
+        raise ValueError()
+    if b.ip in (b.network.network_address, b.network.broadcast_address):
+        raise ValueError()
+except Exception:
+    sys.exit(1)
+sys.exit(0)
+PY
+}
+
+valid_prefix() { [[ "$1" =~ ^[0-9]+$ ]] && (( $1 >= 1 && $1 <= 30 )); }
+valid_mtu() { [[ "$1" =~ ^[0-9]+$ ]] && (( $1 >= 576 && $1 <= 9000 )); }
+valid_ttl() { [[ "$1" =~ ^[0-9]+$ ]] && (( $1 >= 1 && $1 <= 255 )); }
+
+ipv4_pair_available() {
+  python3 - "$CONFIG_DIR" "$1" "$2" "$3" "$4" <<'PYIP'
+import glob, ipaddress, os, subprocess, sys
+config_dir, current_name, local_ip, remote_ip, prefix = sys.argv[1:]
+try:
+    candidate_a = ipaddress.IPv4Interface(local_ip + '/' + prefix)
+    candidate_b = ipaddress.IPv4Interface(remote_ip + '/' + prefix)
+    if candidate_a.network != candidate_b.network or candidate_a.ip == candidate_b.ip:
+        raise ValueError()
+    candidate = candidate_a.network
+except Exception:
+    sys.exit(1)
+
+# Reject overlap with other manager-owned tunnel networks.
+for path in glob.glob(os.path.join(config_dir, '*.conf')):
+    if os.path.basename(path) == current_name + '.conf':
+        continue
+    values = {}
+    try:
+        with open(path, encoding='utf-8') as stream:
+            for line in stream:
+                if '=' in line and not line.lstrip().startswith('#'):
+                    key, value = line.strip().split('=', 1)
+                    values[key] = value
+        if values.get('LOCAL_IPV4') and values.get('PREFIX'):
+            other = ipaddress.IPv4Interface(values['LOCAL_IPV4'] + '/' + values['PREFIX']).network
+            if candidate.overlaps(other):
+                sys.exit(1)
+    except Exception:
+        continue
+
+# Reject overlap with routes on other interfaces (the current tunnel is excluded).
+try:
+    output = subprocess.run(['ip', '-4', 'route', 'show', 'table', 'all'],
+                            text=True, capture_output=True, check=False).stdout
+    for line in output.splitlines():
+        parts = line.split()
+        if not parts or parts[0] == 'default':
+            continue
+        dev = None
+        if 'dev' in parts:
+            idx = parts.index('dev')
+            if idx + 1 < len(parts):
+                dev = parts[idx + 1]
+        if dev == current_name:
+            continue
+        try:
+            network = ipaddress.ip_network(parts[0], strict=False)
+            if network.version == 4 and candidate.overlaps(network):
+                sys.exit(1)
+        except Exception:
+            pass
+except Exception:
+    pass
+sys.exit(0)
+PYIP
+}
+
+is_ipv6_assigned() {
+  local wanted="$1" addr
+  while read -r addr; do
+    [[ "$addr" == "$wanted" ]] && return 0
+  done < <(ip -6 -o addr show 2>/dev/null | awk '{print $4}' | cut -d/ -f1)
+  return 1
+}
+
+print_box_line() {
+  local content="${1:-}" color="${2:-$RESET}"
+  printf '%b│%b  %b%-68.68s%b%b│%b\n' "$CYAN" "$RESET" "$color" "$content" "$RESET" "$CYAN" "$RESET"
+}
+
+repeat_line() {
+  local char="${1:-─}" line
+  printf -v line '%*s' 70 ''
+  printf '%s' "${line// /$char}"
+}
+
+print_box_rule() {
+  printf '%b├%s┤%b\n' "$CYAN" "$(repeat_line '─')" "$RESET"
+}
+
+show_local_ips() {
+  local mode="${1:-plain}" entry
+  local -a v4_entries=() v6_entries=()
+  mapfile -t v4_entries < <(ip -4 -o addr show scope global 2>/dev/null | awk '{print $2 "  " $4}')
+  mapfile -t v6_entries < <(ip -6 -o addr show scope global 2>/dev/null | awk '{print $2 "  " $4}')
+
+  if [[ "$mode" == "boxed" ]]; then
+    print_box_line "NETWORK ADDRESSES" "$BOLD$BLUE"
+    if ((${#v4_entries[@]})); then
+      print_box_line "IPv4"
+      for entry in "${v4_entries[@]}"; do print_box_line "  $entry"; done
+    else
+      print_box_line "IPv4  Not detected" "$YELLOW"
+    fi
+    if ((${#v6_entries[@]})); then
+      print_box_line "IPv6"
+      for entry in "${v6_entries[@]}"; do print_box_line "  $entry"; done
+    else
+      print_box_line "IPv6  Not detected" "$YELLOW"
+    fi
+  else
+    printf '%bIPv4 addresses%b\n' "$BOLD" "$RESET"
+    if ((${#v4_entries[@]})); then
+      for entry in "${v4_entries[@]}"; do printf '  %s\n' "$entry"; done
+    else
+      printf '  %bNot detected%b\n' "$YELLOW" "$RESET"
+    fi
+    printf '%bIPv6 addresses%b\n' "$BOLD" "$RESET"
+    if ((${#v6_entries[@]})); then
+      for entry in "${v6_entries[@]}"; do printf '  %s\n' "$entry"; done
+    else
+      printf '  %bNot detected%b\n' "$YELLOW" "$RESET"
+    fi
+  fi
+}
+
+detect_source_ipv6() {
+  local remote="$1" route src
+  route="$(ip -6 route get "$remote" 2>/dev/null | head -n1 || true)"
+  src="$(awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}' <<< "$route")"
+  [[ -n "$src" ]] || return 1
+  is_ipv6_assigned "$src" || return 1
+  printf '%s' "$src"
+}
+
+detect_route_mtu() {
+  local remote="$1" route dev mtu parent_line
+  route="$(ip -6 route get "$remote" 2>/dev/null | head -n1 || true)"
+  mtu="$(awk '{for(i=1;i<=NF;i++) if($i=="mtu"){print $(i+1); exit}}' <<< "$route")"
+  if [[ -z "$mtu" ]]; then
+    dev="$(awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}' <<< "$route")"
+    if [[ -n "$dev" ]]; then
+      parent_line="$(ip -o link show dev "$dev" 2>/dev/null || true)"
+      mtu="$(sed -n 's/.* mtu \([0-9][0-9]*\).*/\1/p' <<< "$parent_line")"
+    fi
+  fi
+  if [[ "$mtu" =~ ^[0-9]+$ ]] && (( mtu > 44 )); then
+    mtu=$((mtu - 44))
+    (( mtu >= 576 )) || mtu=576
+    (( mtu <= 9000 )) || mtu=9000
+    printf '%s' "$mtu"
+  else
+    printf '1456'
+  fi
+}
+
+allocate_ipv4_pair() {
+  local result
+  result="$(python3 - "$CONFIG_DIR" "$DEFAULT_POOL" <<'PY'
+import glob, ipaddress, os, subprocess, sys
+config_dir, pool_text = sys.argv[1], sys.argv[2]
+pool = ipaddress.ip_network(pool_text, strict=True)
+used = []
+
+def add_net(value):
+    try:
+        n = ipaddress.ip_network(value, strict=False)
+        if n.version == 4:
+            used.append(n)
+    except Exception:
+        pass
+
+try:
+    routes = subprocess.run(['ip', '-4', 'route', 'show', 'table', 'all'], text=True, capture_output=True).stdout
+    for line in routes.splitlines():
+        parts = line.split()
+        if parts and parts[0] != 'default':
+            add_net(parts[0])
+except Exception:
+    pass
+try:
+    addrs = subprocess.run(['ip', '-4', '-o', 'addr', 'show'], text=True, capture_output=True).stdout
+    for line in addrs.splitlines():
+        parts = line.split()
+        if 'inet' in parts:
+            i = parts.index('inet')
+            if i + 1 < len(parts):
+                add_net(parts[i+1])
+except Exception:
+    pass
+for path in glob.glob(os.path.join(config_dir, '*.conf')):
+    vals = {}
+    try:
+        with open(path, encoding='utf-8') as f:
+            for line in f:
+                if '=' in line:
+                    k, v = line.strip().split('=', 1)
+                    vals[k] = v
+        if vals.get('LOCAL_IPV4') and vals.get('REMOTE_IPV4'):
+            a = ipaddress.IPv4Interface(vals['LOCAL_IPV4'] + '/30').network
+            b = ipaddress.IPv4Interface(vals['REMOTE_IPV4'] + '/30').network
+            if a == b:
+                used.append(a)
+    except Exception:
+        pass
+if pool.version != 4 or pool.prefixlen > 30:
+    sys.exit(2)
+for net in pool.subnets(new_prefix=30):
+    if not any(net.overlaps(x) for x in used):
+        print(str(net.network_address + 1), str(net.network_address + 2))
+        sys.exit(0)
+sys.exit(3)
+PY
+)" || return 1
+  read -r C_LOCAL_IPV4 C_REMOTE_IPV4 <<< "$result"
+  [[ -n "$C_LOCAL_IPV4" && -n "$C_REMOTE_IPV4" ]]
+}
+
+reset_config_values() {
+  C_VERSION=""; C_NAME=""; C_ROLE=""; C_LOCAL_IPV6=""; C_REMOTE_IPV6=""
+  C_LOCAL_IPV4=""; C_REMOTE_IPV4=""; C_PREFIX="30"; C_TTL="$DEFAULT_TTL"; C_MTU="1456"
+}
+
+assign_config_value() {
+  local key="$1" value="$2"
+  case "$key" in
+    VERSION) C_VERSION="$value" ;;
+    NAME) C_NAME="$value" ;;
+    ROLE) C_ROLE="$value" ;;
+    LOCAL_IPV6) C_LOCAL_IPV6="$value" ;;
+    REMOTE_IPV6) C_REMOTE_IPV6="$value" ;;
+    LOCAL_IPV4) C_LOCAL_IPV4="$value" ;;
+    REMOTE_IPV4) C_REMOTE_IPV4="$value" ;;
+    PREFIX) C_PREFIX="$value" ;;
+    TTL) C_TTL="$value" ;;
+    MTU) C_MTU="$value" ;;
+    *) ;;
+  esac
+}
+
+read_config() {
+  local file="$1" key value
+  reset_config_values
+  while IFS='=' read -r key value || [[ -n "${key:-}" ]]; do
+    [[ -z "${key:-}" || "$key" == \#* ]] && continue
+    value="${value%$'\r'}"
+    assign_config_value "$key" "$value"
+  done < "$file"
+}
+
+read_config_text() {
+  local content="$1" key value
+  reset_config_values
+  while IFS='=' read -r key value || [[ -n "${key:-}" ]]; do
+    [[ -z "${key:-}" || "$key" == \#* ]] && continue
+    value="${value%$'\r'}"
+    assign_config_value "$key" "$value"
+  done <<< "$content"
+}
+
+validate_loaded_config() {
+  [[ "$C_VERSION" == "1" ]] || die "Unsupported configuration file version." || return 1
+  valid_name "$C_NAME" || die "Invalid tunnel name in configuration file." || return 1
+  [[ "$C_ROLE" == "foreign" || "$C_ROLE" == "iran" ]] || die "Invalid server role in configuration file." || return 1
+  valid_ipv6 "$C_LOCAL_IPV6" || die "Invalid local IPv6 address." || return 1
+  valid_ipv6 "$C_REMOTE_IPV6" || die "Invalid remote IPv6 address." || return 1
+  valid_prefix "$C_PREFIX" || die "Invalid IPv4 prefix." || return 1
+  valid_ipv4_pair "$C_LOCAL_IPV4" "$C_REMOTE_IPV4" "$C_PREFIX" || die "Invalid IPv4 pair or prefix." || return 1
+  valid_ttl "$C_TTL" || die "Invalid TTL value." || return 1
+  valid_mtu "$C_MTU" || die "Invalid MTU value." || return 1
+  [[ "$C_LOCAL_IPV6" != "$C_REMOTE_IPV6" ]] || die "The local and remote IPv6 addresses must be different." || return 1
+  return 0
+}
+
+save_config() {
+  local path="$CONFIG_DIR/$C_NAME.conf" tmp
+  tmp="$(mktemp "$CONFIG_DIR/.${C_NAME}.XXXXXX")"
+  chmod 0600 "$tmp"
+  cat > "$tmp" <<EOF
+# IPv6 GRE Tunnel Manager configuration
+VERSION=1
+NAME=$C_NAME
+ROLE=$C_ROLE
+LOCAL_IPV6=$C_LOCAL_IPV6
+REMOTE_IPV6=$C_REMOTE_IPV6
+LOCAL_IPV4=$C_LOCAL_IPV4
+REMOTE_IPV4=$C_REMOTE_IPV4
+PREFIX=$C_PREFIX
+TTL=$C_TTL
+MTU=$C_MTU
+EOF
+  mv -f "$tmp" "$path"
+  chmod 0600 "$path"
+}
+
+generate_peer_update_link() {
+  local result link password target_role
+  [[ "$C_ROLE" == "foreign" || "$C_ROLE" == "iran" ]] || { die "The tunnel role is invalid."; return 1; }
+  [[ -x "$CRYPTO_HELPER" ]] || { die "Encryption helper is missing: $CRYPTO_HELPER. Re-run install.sh."; return 1; }
+  if [[ "$C_ROLE" == "foreign" ]]; then target_role="iran"; else target_role="foreign"; fi
+  result="$(python3 "$CRYPTO_HELPER" encrypt-target \
+    "$target_role" "$C_NAME" "$C_REMOTE_IPV6" "$C_LOCAL_IPV6" \
+    "$C_REMOTE_IPV4" "$C_LOCAL_IPV4" "$C_PREFIX" "$C_TTL" "$C_MTU")" || {
+      die "Could not generate the encrypted peer update link."
+      return 1
+    }
+  link="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["link"])' <<< "$result")" || return 1
+  password="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["password"])' <<< "$result")" || return 1
+  echo
+  printf '%b  ENCRYPTED %s PEER UPDATE LINK%b\n' "$BOLD$GREEN" "${target_role^^}" "$RESET"
+  printf '%s\n' "$link"
+  echo
+  printf '%b  DECRYPTION PASSWORD%b\n' "$BOLD$YELLOW" "$RESET"
+  printf '%s\n' "$password"
+  echo
+  warn "Share the password separately from the link."
+  info "Import this link on the ${target_role^^} server to apply the matching tunnel update."
+}
+
+generate_iran_import_link() {
+  [[ "$C_ROLE" == "foreign" ]] || { die "An Iran import link can only be generated from a Foreign-side tunnel."; return 1; }
+  generate_peer_update_link
+}
+
+service_name() { printf '%s%s.service' "$SERVICE_PREFIX" "$1"; }
+
+apply_tunnel() {
+  local name="$1" file="$CONFIG_DIR/$1.conf" created=0 addr
+  [[ -f "$file" ]] || die "Configuration for tunnel $name was not found." || return 1
+  read_config "$file"
+  validate_loaded_config || return 1
+  if ! is_ipv6_assigned "$C_LOCAL_IPV6"; then
+    die "Local IPv6 $C_LOCAL_IPV6 is not assigned to this server. Tunnel was not changed."
+    return 1
+  fi
+
+  if ip link show dev "$C_NAME" >/dev/null 2>&1; then
+    if ip -6 tunnel show "$C_NAME" >/dev/null 2>&1; then
+      # Update an existing IPv6 GRE interface in place; do not delete/recreate it.
+      if ! ip -6 tunnel change "$C_NAME" mode ip6gre remote "$C_REMOTE_IPV6" local "$C_LOCAL_IPV6" hoplimit "$C_TTL"; then
+        die "Could not update the existing IPv6 GRE endpoints in place. The current interface was left intact."
+        return 1
+      fi
+    else
+      die "Interface $C_NAME exists but is not an IPv6 tunnel. Aborting to avoid modifying another device."
+      return 1
+    fi
+  else
+    if ! ip -6 tunnel add "$C_NAME" mode ip6gre local "$C_LOCAL_IPV6" remote "$C_REMOTE_IPV6" ttl "$C_TTL"; then
+      die "Failed to create the IPv6 GRE interface. Check the addresses, kernel support, and firewall rules."
+      return 1
+    fi
+    created=1
+  fi
+
+  if ! ip link set dev "$C_NAME" mtu "$C_MTU"; then
+    (( created == 1 )) && ip link delete dev "$C_NAME" >/dev/null 2>&1 || true
+    die "Failed to set tunnel MTU."
+    return 1
+  fi
+
+  # Remove stale IPv4 addresses owned by this tunnel before assigning the new local address.
+  while IFS= read -r addr; do
+    [[ -z "$addr" || "$addr" == "$C_LOCAL_IPV4/$C_PREFIX" ]] && continue
+    ip -4 addr del "$addr" dev "$C_NAME" >/dev/null 2>&1 || {
+      (( created == 1 )) && ip link delete dev "$C_NAME" >/dev/null 2>&1 || true
+      die "Could not replace the previous tunnel IPv4 address ($addr)."
+      return 1
+    }
+  done < <(ip -4 -o addr show dev "$C_NAME" scope global 2>/dev/null | awk '{print $4}')
+
+  if ! ip -4 addr replace "$C_LOCAL_IPV4/$C_PREFIX" dev "$C_NAME" || ! ip link set dev "$C_NAME" up; then
+    (( created == 1 )) && ip link delete dev "$C_NAME" >/dev/null 2>&1 || true
+    die "Failed to configure the tunnel IPv4 address or bring the interface up."
+    return 1
+  fi
+  ok "Tunnel $C_NAME is up: $C_LOCAL_IPV4 <-> $C_REMOTE_IPV4 (interface updated in place when already present)."
+}
+
+down_tunnel() {
+  local name="$1"
+  if ip -6 tunnel show "$name" >/dev/null 2>&1; then
+    ip link delete dev "$name"
+    ok "Tunnel $name stopped and its interface was removed."
+  else
+    info "Tunnel $name is not currently active."
+  fi
+}
+
+list_tunnels() {
+  local file
+  local found=0
+  for file in "$CONFIG_DIR"/*.conf; do
+    [[ -f "$file" ]] || continue
+    found=1
+    basename "$file" .conf
+  done
+  (( found == 1 )) || return 1
+}
+
+choose_tunnel() {
+  local -a names=() file choice
+  for file in "$CONFIG_DIR"/*.conf; do
+    [[ -f "$file" ]] || continue
+    names+=("$(basename "$file" .conf)")
+  done
+  if ((${#names[@]} == 0)); then
+    warn "No tunnels have been configured yet."
+    return 1
+  fi
+  echo
+  printf '%b  SELECT TUNNEL%b\n' "$BOLD$BLUE" "$RESET"
+  local i=1
+  for choice in "${names[@]}"; do
+    printf '  %b[%02d]%b  %s\n' "$CYAN" "$i" "$RESET" "$choice"
+    ((i+=1))
+  done
+  printf '  %b[00]%b  Back\n' "$DIM" "$RESET"
+  read -rp "Select tunnel number: " choice
+  [[ "$choice" == "0" ]] && return 1
+  [[ "$choice" =~ ^[0-9]+$ ]] || { warn "Invalid selection."; return 1; }
+  (( choice >= 1 && choice <= ${#names[@]} )) || { warn "Invalid selection."; return 1; }
+  SELECTED_TUNNEL="${names[$((choice-1))]}"
+  return 0
+}
+
+next_tunnel_name() {
+  local i=1
+  while (( i < 10000 )); do
+    if [[ ! -f "$CONFIG_DIR/gre${i}.conf" ]]; then
+      printf 'gre%s' "$i"
+      return 0
+    fi
+    ((i+=1))
+  done
+  return 1
+}
+
+create_foreign_tunnel() {
+  local default_name name remote local_ip detected mtu answer
+  default_name="$(next_tunnel_name)" || { die "Could not find an available tunnel name."; return 1; }
+  echo
+  read -rp "Tunnel name [$default_name]: " name
+  name="${name:-$default_name}"
+  valid_name "$name" || { die "Invalid name. Use up to 15 characters: letters, numbers, _ or -; the first character must be a letter."; return 1; }
+  [[ ! -e "$CONFIG_DIR/$name.conf" ]] || { die "Tunnel $name already exists."; return 1; }
+
+  read -rp "Iran server public IPv6: " remote
+  valid_ipv6 "$remote" || { die "The supplied IPv6 address is invalid."; return 1; }
+  detected="$(detect_source_ipv6 "$remote" || true)"
+  if [[ -n "$detected" ]]; then
+    echo "Detected local IPv6 for this destination route: $detected"
+    read -rp "Use this IPv6? [Y/n]: " answer
+    if [[ "$answer" =~ ^[Nn]$ ]]; then
+      detected=""
+    fi
+  fi
+  if [[ -z "$detected" ]]; then
+    show_local_ips
+    read -rp "Enter the Foreign server local IPv6: " detected
+    valid_ipv6 "$detected" && is_ipv6_assigned "$detected" || { die "The selected IPv6 address is not assigned to this server."; return 1; }
+  fi
+  local_ip="$detected"
+  mtu="$(detect_route_mtu "$remote")"
+  echo "Suggested MTU based on the outgoing interface: $mtu (assumes 44 bytes of IPv6 GRE overhead)."
+  read -rp "Tunnel MTU [$mtu]: " answer
+  C_MTU="${answer:-$mtu}"
+  valid_mtu "$C_MTU" || { die "Invalid MTU. Allowed range: 576-9000."; return 1; }
+
+  allocate_ipv4_pair || { die "No free /30 subnet was found in $DEFAULT_POOL, or required network tools are unavailable."; return 1; }
+  C_VERSION="1"; C_NAME="$name"; C_ROLE="foreign"
+  C_LOCAL_IPV6="$local_ip"; C_REMOTE_IPV6="$remote"
+  C_PREFIX="30"; C_TTL="$DEFAULT_TTL"
+  save_config
+  ok "Foreign-side configuration saved."
+  echo
+  echo "  Tunnel       : $C_NAME"
+  echo "  Foreign IPv6 : $C_LOCAL_IPV6"
+  echo "  Iran IPv6    : $C_REMOTE_IPV6"
+  echo "  Foreign tunnel IPv4 : $C_LOCAL_IPV4/30"
+  echo "  Iran tunnel IPv4    : $C_REMOTE_IPV4/30"
+  echo "  MTU          : $C_MTU"
+  generate_iran_import_link || return 1
+  read -rp "Enable this tunnel automatically at boot? [Y/n]: " answer
+  if [[ ! "$answer" =~ ^[Nn]$ ]]; then
+    systemctl enable --now "$(service_name "$name")"
+  else
+    apply_tunnel "$name"
+  fi
+  echo
+  warn "Ping may fail until the import link is used and the tunnel is brought up on the Iran server."
+  info "No configuration file is required."
+}
+
+import_peer_config() {
+  local input password decoded answer current_role file old_config existed=0 svc
+  echo
+  read -rp "Paste the encrypted peer link (or a legacy config file path): " input
+  if [[ "$input" == gre1://import/* ]]; then
+    read -rsp "Decryption password: " password
+    echo
+    decoded="$(printf '%s\n%s\n' "$input" "$password" | python3 "$CRYPTO_HELPER" decrypt)" || {
+      unset password
+      die "Import link could not be decrypted or authenticated."
+      return 1
+    }
+    unset password
+    read_config_text "$decoded"
+  else
+    input="${input%\"}"; input="${input#\"}"
+    [[ -f "$input" ]] || { die "Invalid import link or file not found: $input"; return 1; }
+    read_config "$input"
+  fi
+  validate_loaded_config || return 1
+  ipv4_pair_available "$C_NAME" "$C_LOCAL_IPV4" "$C_REMOTE_IPV4" "$C_PREFIX" || {
+    die "The imported IPv4 subnet overlaps another tunnel or a route on this server."
+    return 1
+  }
+
+  current_role="$(cat "$ROLE_FILE" 2>/dev/null || true)"
+  [[ "$current_role" == "foreign" || "$current_role" == "iran" ]] || {
+    die "Select this server's role before importing a peer configuration."
+    return 1
+  }
+  [[ "$C_ROLE" == "$current_role" ]] || {
+    die "This link targets the ${C_ROLE^^} role, but this server is configured as ${current_role^^}."
+    return 1
+  }
+
+  if ! is_ipv6_assigned "$C_LOCAL_IPV6"; then
+    err "The configured local IPv6 ($C_LOCAL_IPV6) is not assigned to this server."
+    echo "IPv6 addresses currently assigned to this server:"
+    show_local_ips
+    echo "Edit the peer tunnel again using this server's current IPv6 address, then generate a new peer update link."
+    return 1
+  fi
+
+  file="$CONFIG_DIR/$C_NAME.conf"
+  if [[ -f "$file" ]]; then
+    existed=1
+    old_config="$(cat "$file")"
+    echo
+    echo "Existing tunnel: $C_NAME"
+    echo "The configuration will be updated without deleting the GRE interface."
+    read -rp "Apply this update in place? [y/N]: " answer
+    [[ "$answer" =~ ^[Yy]$ ]] || return 0
+  fi
+
+  save_config
+  if ! apply_tunnel "$C_NAME"; then
+    if (( existed == 1 )); then
+      local restore_tmp
+      restore_tmp="$(mktemp "$CONFIG_DIR/.${C_NAME}.rollback.XXXXXX")"
+      printf '%s\n' "$old_config" > "$restore_tmp"
+      chmod 0600 "$restore_tmp"
+      mv -f "$restore_tmp" "$file"
+      warn "The previous configuration was restored."
+      apply_tunnel "$C_NAME" || warn "Automatic interface rollback failed; inspect the tunnel manually."
+    else
+      rm -f "$file"
+    fi
+    return 1
+  fi
+
+  ok "Peer configuration for tunnel $C_NAME imported and applied."
+  echo "  Local IPv6    : $C_LOCAL_IPV6"
+  echo "  Remote IPv6   : $C_REMOTE_IPV6"
+  echo "  Local tunnel IPv4  : $C_LOCAL_IPV4/$C_PREFIX"
+  echo "  Remote tunnel IPv4 : $C_REMOTE_IPV4/$C_PREFIX"
+  echo "  MTU           : $C_MTU"
+
+  if (( existed == 0 )); then
+    read -rp "Enable this tunnel automatically at boot? [Y/n]: " answer
+    if [[ ! "$answer" =~ ^[Nn]$ ]]; then
+      systemctl enable --now "$(service_name "$C_NAME")"
+    fi
+  else
+    svc="$(service_name "$C_NAME")"
+    if systemctl is-enabled --quiet "$svc" 2>/dev/null; then
+      ok "Existing startup setting preserved: enabled."
+    else
+      info "Existing startup setting preserved: disabled."
+    fi
+  fi
+}
+
+edit_tunnel() {
+  local name="$1" file="$CONFIG_DIR/$1.conf" old_config input answer
+  [[ -f "$file" ]] || { die "Configuration for tunnel $name was not found."; return 1; }
+  read_config "$file"
+  old_config="$(cat "$file")"
+
+  echo
+  printf '%b  EDIT TUNNEL: %s%b\n' "$BOLD$BLUE" "$C_NAME" "$RESET"
+  info "Blank input keeps the current value. The local IPv6 must already be assigned to this server."
+  info "Public IPv4 is not used by this IPv6 GRE transport; the IPv4 fields below are the private tunnel addresses."
+  echo
+  echo "Current local IPv6  : $C_LOCAL_IPV6"
+  read -rp "New local server IPv6 [$C_LOCAL_IPV6]: " input
+  C_LOCAL_IPV6="${input:-$C_LOCAL_IPV6}"
+  echo "Current peer IPv6   : $C_REMOTE_IPV6"
+  read -rp "New peer server IPv6 [$C_REMOTE_IPV6]: " input
+  C_REMOTE_IPV6="${input:-$C_REMOTE_IPV6}"
+  echo "Current local tunnel IPv4  : $C_LOCAL_IPV4"
+  read -rp "New local tunnel IPv4 [$C_LOCAL_IPV4]: " input
+  C_LOCAL_IPV4="${input:-$C_LOCAL_IPV4}"
+  echo "Current peer tunnel IPv4   : $C_REMOTE_IPV4"
+  read -rp "New peer tunnel IPv4 [$C_REMOTE_IPV4]: " input
+  C_REMOTE_IPV4="${input:-$C_REMOTE_IPV4}"
+  read -rp "IPv4 prefix [/$C_PREFIX]: " input
+  C_PREFIX="${input:-$C_PREFIX}"
+  read -rp "GRE hop limit [$C_TTL]: " input
+  C_TTL="${input:-$C_TTL}"
+  read -rp "Tunnel MTU [$C_MTU]: " input
+  C_MTU="${input:-$C_MTU}"
+
+  valid_ipv6 "$C_LOCAL_IPV6" || { die "Invalid local IPv6 address."; return 1; }
+  valid_ipv6 "$C_REMOTE_IPV6" || { die "Invalid peer IPv6 address."; return 1; }
+  [[ "$C_LOCAL_IPV6" != "$C_REMOTE_IPV6" ]] || { die "Local and peer IPv6 addresses must be different."; return 1; }
+  is_ipv6_assigned "$C_LOCAL_IPV6" || { die "Local IPv6 $C_LOCAL_IPV6 is not assigned to this server."; return 1; }
+  valid_prefix "$C_PREFIX" || { die "Invalid prefix. Use a value from 1 to 30."; return 1; }
+  valid_ipv4_pair "$C_LOCAL_IPV4" "$C_REMOTE_IPV4" "$C_PREFIX" || { die "Invalid tunnel IPv4 pair or prefix."; return 1; }
+  ipv4_pair_available "$C_NAME" "$C_LOCAL_IPV4" "$C_REMOTE_IPV4" "$C_PREFIX" || {
+    die "The selected IPv4 subnet overlaps another tunnel or a route on this server."
+    return 1
+  }
+  valid_ttl "$C_TTL" || { die "Invalid GRE hop limit. Allowed range: 1-255."; return 1; }
+  valid_mtu "$C_MTU" || { die "Invalid MTU. Allowed range: 576-9000."; return 1; }
+
+  # Check the crypto helper before changing the live interface.
+  [[ -x "$CRYPTO_HELPER" ]] || { die "Encryption helper is missing. Re-run install.sh."; return 1; }
+
+  save_config
+  if ! apply_tunnel "$C_NAME"; then
+    local restore_tmp
+    restore_tmp="$(mktemp "$CONFIG_DIR/.${C_NAME}.rollback.XXXXXX")"
+    printf '%s\n' "$old_config" > "$restore_tmp"
+    chmod 0600 "$restore_tmp"
+    mv -f "$restore_tmp" "$file"
+    warn "The previous configuration file was restored. Reapplying the previous live settings..."
+    apply_tunnel "$C_NAME" || warn "Automatic rollback failed; inspect the interface manually."
+    return 1
+  fi
+
+  read_config "$file"
+  ok "Local tunnel settings updated without deleting the GRE interface."
+  echo
+  echo "  Local IPv6       : $C_LOCAL_IPV6"
+  echo "  Peer IPv6        : $C_REMOTE_IPV6"
+  echo "  Local tunnel IPv4: $C_LOCAL_IPV4/$C_PREFIX"
+  echo "  Peer tunnel IPv4 : $C_REMOTE_IPV4/$C_PREFIX"
+  echo "  MTU              : $C_MTU"
+  echo
+  generate_peer_update_link || {
+    warn "The local tunnel was updated, but a peer link could not be generated. Generate it later from Manage Tunnels."
+    return 1
+  }
+  warn "Import this link on the peer server to complete the update on both ends."
+  info "Until the peer imports the link, the tunnel may not pass traffic if an endpoint or tunnel IPv4 changed."
+}
+
+status_tunnel() {
+  local name="$1" file="$CONFIG_DIR/$1.conf"
+  [[ -f "$file" ]] || { warn "Configuration for $name was not found."; return 1; }
+  read_config "$file"
+  echo
+  printf '%b%s%b\n' "$CYAN" "--- $C_NAME ---" "$RESET"
+  echo "Role          : $C_ROLE"
+  echo "Local IPv6    : $C_LOCAL_IPV6"
+  echo "Remote IPv6   : $C_REMOTE_IPV6"
+  echo "Local tunnel IPv4 : $C_LOCAL_IPV4/$C_PREFIX"
+  echo "Peer tunnel IPv4  : $C_REMOTE_IPV4/$C_PREFIX"
+  echo "MTU           : $C_MTU"
+  if ip link show dev "$C_NAME" >/dev/null 2>&1; then
+    ip -s link show dev "$C_NAME" | sed 's/^/  /'
+    if ip link show dev "$C_NAME" | grep -q '<[^>]*UP'; then
+      ok "Tunnel interface is UP."
+    else
+      warn "Interface exists but is not UP."
+    fi
+    echo
+    info "Pinging the remote tunnel IPv4 address:"
+    ping -4 -I "$C_LOCAL_IPV4" -c 4 -W 2 "$C_REMOTE_IPV4" || warn "Ping failed. Check the peer tunnel, firewall rules, and IPv6 path."
+  else
+    warn "Tunnel interface is down."
+  fi
+  local svc
+  svc="$(service_name "$C_NAME")"
+  if systemctl is-enabled --quiet "$svc" 2>/dev/null; then
+    ok "Startup: enabled"
+  else
+    info "Startup: disabled"
+  fi
+}
+
+status_all() {
+  local file found=0
+  for file in "$CONFIG_DIR"/*.conf; do
+    [[ -f "$file" ]] || continue
+    found=1
+    status_tunnel "$(basename "$file" .conf)"
+  done
+  (( found == 1 )) || warn "No tunnels are configured."
+}
+
+speed_test() {
+  local name="$1" file="$CONFIG_DIR/$1.conf" choice
+  [[ -f "$file" ]] || { die "Tunnel configuration was not found."; return 1; }
+  read_config "$file"
+  if ! command -v iperf3 >/dev/null 2>&1; then
+    die "iperf3 is not installed. Run install.sh again."; return 1
+  fi
+  if ! ip link show dev "$C_NAME" >/dev/null 2>&1; then
+    warn "Bring the tunnel up first."
+    return 1
+  fi
+  echo
+  echo "Bandwidth test: $C_NAME ($C_LOCAL_IPV4 <-> $C_REMOTE_IPV4)"
+  echo "For a bidirectional test, iperf3 must also be running on the peer server."
+  echo "  1) Start an iperf3 server on this side"
+  echo "  2) Test upload from this server to the peer"
+  echo "  3) Test download from the peer to this server (-R)"
+  echo "  0) Back"
+  read -rp "Select option: " choice
+  case "$choice" in
+    1)
+      info "iperf3 server listening on $C_LOCAL_IPV4:5201. Press Ctrl+C to stop."
+      warn "If a firewall is enabled, allow TCP port 5201 only on the tunnel interface/address."
+      iperf3 -s -B "$C_LOCAL_IPV4" || true
+      ;;
+    2)
+      info "Run this on the peer first: iperf3 -s -B $C_REMOTE_IPV4"
+      iperf3 -c "$C_REMOTE_IPV4" -B "$C_LOCAL_IPV4" -t 10 -P 4 || warn "Upload test failed."
+      ;;
+    3)
+      info "Run this on the peer first: iperf3 -s -B $C_REMOTE_IPV4"
+      iperf3 -c "$C_REMOTE_IPV4" -B "$C_LOCAL_IPV4" -t 10 -P 4 -R || warn "Download test failed."
+      ;;
+    0) return 0 ;;
+    *) warn "Invalid selection." ;;
+  esac
+}
+
+restart_tunnel() {
+  local name="$1" svc
+  svc="$(service_name "$name")"
+  if systemctl is-enabled --quiet "$svc" 2>/dev/null && ! systemctl is-active --quiet "$svc" 2>/dev/null; then
+    systemctl start "$svc"
+  else
+    apply_tunnel "$name"
+  fi
+}
+
+enable_startup() {
+  local name="$1"
+  systemctl enable --now "$(service_name "$name")"
+  ok "Startup enabled for $name."
+}
+
+disable_startup() {
+  local name="$1"
+  systemctl disable "$(service_name "$name")"
+  ok "Startup disabled for $name. The currently running tunnel remains up."
+}
+
+stop_tunnel() {
+  local name="$1" svc
+  svc="$(service_name "$name")"
+  if systemctl is-active --quiet "$svc" 2>/dev/null; then
+    systemctl stop "$svc"
+  else
+    down_tunnel "$name"
+  fi
+}
+
+delete_tunnel() {
+  local name="$1" answer svc
+  [[ -f "$CONFIG_DIR/$name.conf" ]] || { die "Tunnel is not configured on this server."; return 1; }
+  read -rp "Delete tunnel $name from this server? [y/N]: " answer
+  [[ "$answer" =~ ^[Yy]$ ]] || return 0
+  svc="$(service_name "$name")"
+  systemctl disable --now "$svc" >/dev/null 2>&1 || true
+  down_tunnel "$name" >/dev/null 2>&1 || true
+  rm -f "$CONFIG_DIR/$name.conf"
+  rm -f "$EXPORT_DIR/${name}-iran.conf"
+  systemctl reset-failed "$svc" >/dev/null 2>&1 || true
+  ok "Local configuration for tunnel $name was deleted."
+  warn "To remove the connection completely, also delete the matching configuration on the peer server."
+}
+
+manage_tunnel() {
+  local name choice
+  choose_tunnel || return 0
+  name="$SELECTED_TUNNEL"
+  while true; do
+    echo
+    echo "Manage tunnel: $name"
+    echo "  1) View status and ping"
+    echo "  2) Apply configuration / restart"
+    echo "  3) Enable startup"
+    echo "  4) Disable startup (keep current tunnel running)"
+    echo "  5) Stop tunnel"
+    echo "  6) Bandwidth test"
+    echo "  7) Delete tunnel from this server"
+    echo "  8) Edit tunnel settings (update in place)"
+    echo "  9) Generate encrypted peer update link"
+    echo "  0) Back"
+    read -rp "Select option: " choice
+    case "$choice" in
+      1) status_tunnel "$name" ;;
+      2) restart_tunnel "$name" ;;
+      3) enable_startup "$name" ;;
+      4) disable_startup "$name" ;;
+      5) stop_tunnel "$name" ;;
+      6) speed_test "$name" ;;
+      7) delete_tunnel "$name"; break ;;
+      8) edit_tunnel "$name" ;;
+      9)
+        read_config "$CONFIG_DIR/$name.conf"
+        generate_peer_update_link
+        ;;
+      0) break ;;
+      *) warn "Invalid selection." ;;
+    esac
+  done
+}
+
+bulk_startup_action() {
+  local action="$1" file name
+  local found=0
+  for file in "$CONFIG_DIR"/*.conf; do
+    [[ -f "$file" ]] || continue
+    found=1
+    name="$(basename "$file" .conf)"
+    if [[ "$action" == "enable" ]]; then
+      enable_startup "$name"
+    else
+      disable_startup "$name"
+    fi
+  done
+  (( found == 1 )) || warn "No tunnels are configured."
+}
+
+show_exports() {
+  local name
+  echo
+  info "Select a tunnel to generate a fresh encrypted peer update link."
+  choose_tunnel || return 0
+  name="$SELECTED_TUNNEL"
+  read_config "$CONFIG_DIR/$name.conf"
+  generate_peer_update_link
+}
+
+select_role() {
+  local choice
+  echo
+  printf '%b╭%s╮%b\n' "$BLUE" "$(repeat_line '─')" "$RESET"
+  print_box_line "SELECT SERVER ROLE" "$BOLD$BLUE"
+  print_box_line "[1]  FOREIGN SERVER  - Create and manage tunnels"
+  print_box_line "[2]  IRAN SERVER     - Import a tunnel configuration"
+  printf '%b╰%s╯%b\n' "$BLUE" "$(repeat_line '─')" "$RESET"
+  read -rp "Select role [1-2]: " choice
+  case "$choice" in
+    1) printf 'foreign\n' > "$ROLE_FILE"; chmod 0600 "$ROLE_FILE"; ok "Role set to FOREIGN SERVER." ;;
+    2) printf 'iran\n' > "$ROLE_FILE"; chmod 0600 "$ROLE_FILE"; ok "Role set to IRAN SERVER." ;;
+    *) warn "Invalid selection."; return 1 ;;
+  esac
+}
+
+show_dashboard() {
+  local role count=0 active=0 inactive=0 file name host os_name role_label header tunnel_summary
+  role="$(cat "$ROLE_FILE" 2>/dev/null || echo unset)"
+  host="$(hostname -s 2>/dev/null || hostname)"
+  os_name="$(. /etc/os-release 2>/dev/null; printf '%s' "${PRETTY_NAME:-Ubuntu}")"
+  if ((${#os_name} > 43)); then os_name="${os_name:0:40}..."; fi
+
+  for file in "$CONFIG_DIR"/*.conf; do
+    [[ -f "$file" ]] || continue
+    ((count+=1))
+    name="$(basename "$file" .conf)"
+    if ip link show dev "$name" 2>/dev/null | grep -q '<[^>]*UP'; then
+      ((active+=1))
+    else
+      ((inactive+=1))
+    fi
+  done
+
+  case "$role" in
+    foreign) role_label="FOREIGN SERVER" ;;
+    iran) role_label="IRAN SERVER" ;;
+    *) role_label="NOT SELECTED" ;;
+  esac
+  printf -v header '%-52s v%s' "IPv6 GRE TUNNEL MANAGER" "$VERSION"
+  tunnel_summary="Tunnels : $count total  |  $active UP  |  $inactive DOWN"
+
+  clear 2>/dev/null || true
+  printf '%b╭%s╮%b\n' "$CYAN" "$(repeat_line '─')" "$RESET"
+  print_box_line "$header" "$BOLD$WHITE"
+  print_box_line "Point-to-point IPv4 connectivity over IPv6 GRE" "$DIM"
+  print_box_rule
+  print_box_line "SYSTEM OVERVIEW" "$BOLD$BLUE"
+  print_box_line "Host        : $host"
+  print_box_line "Operating OS: $os_name"
+  print_box_line "Role        : $role_label" "$BOLD$GREEN"
+  print_box_line "$tunnel_summary" "$BOLD"
+  print_box_rule
+  show_local_ips boxed
+  print_box_rule
+  print_box_line "TUNNEL DEFAULTS" "$BOLD$BLUE"
+  print_box_line "IPv4 pool   : $DEFAULT_POOL  |  Allocation: /30 per tunnel"
+  print_box_line "Routing     : Default route unchanged"
+  print_box_line "NAT rules   : Not modified  |  IP forwarding: Not modified"
+  printf '%b╰%s╯%b\n' "$CYAN" "$(repeat_line '─')" "$RESET"
+  echo
+}
+
+main_menu() {
+  local role choice
+  while true; do
+    show_dashboard
+    role="$(cat "$ROLE_FILE" 2>/dev/null || echo unset)"
+    if [[ "$role" == "unset" ]]; then
+      select_role || { read -rp "Press Enter to continue..."; continue; }
+      continue
+    fi
+
+    printf '%b  MAIN MENU%b\n' "$BOLD$BLUE" "$RESET"
+    printf '%b  ────────────────────────────────────────────────────────────────%b\n' "$DIM" "$RESET"
+    if [[ "$role" == "foreign" ]]; then
+      printf '  %b[1]%b  Create a new tunnel\n' "$CYAN" "$RESET"
+      printf '  %b[2]%b  Manage tunnels\n' "$CYAN" "$RESET"
+      printf '  %b[3]%b  Check all tunnels and ping\n' "$CYAN" "$RESET"
+      printf '  %b[4]%b  Tunnel bandwidth test\n' "$CYAN" "$RESET"
+      printf '  %b[5]%b  Delete a tunnel\n' "$CYAN" "$RESET"
+      printf '  %b[6]%b  Enable startup for all tunnels\n' "$CYAN" "$RESET"
+      printf '  %b[7]%b  Disable startup for all tunnels\n' "$CYAN" "$RESET"
+      printf '  %b[8]%b  Generate encrypted peer update link\n' "$CYAN" "$RESET"
+      printf '  %b[9]%b  Change server role\n' "$CYAN" "$RESET"
+      printf '  %b[10]%b Import encrypted peer update link\n' "$CYAN" "$RESET"
+    else
+      printf '  %b[1]%b  Import encrypted configuration / peer update\n' "$CYAN" "$RESET"
+      printf '  %b[2]%b  Manage tunnels\n' "$CYAN" "$RESET"
+      printf '  %b[3]%b  Check all tunnels and ping\n' "$CYAN" "$RESET"
+      printf '  %b[4]%b  Tunnel bandwidth test\n' "$CYAN" "$RESET"
+      printf '  %b[5]%b  Delete a tunnel\n' "$CYAN" "$RESET"
+      printf '  %b[6]%b  Enable startup for all tunnels\n' "$CYAN" "$RESET"
+      printf '  %b[7]%b  Disable startup for all tunnels\n' "$CYAN" "$RESET"
+      printf '  %b[8]%b  Refresh server IP addresses\n' "$CYAN" "$RESET"
+      printf '  %b[9]%b  Change server role\n' "$CYAN" "$RESET"
+    fi
+    printf '  %b[0]%b  Exit\n' "$RED" "$RESET"
+    echo
+    if [[ "$role" == "foreign" ]]; then
+      read -rp "Select option [0-10]: " choice
+    else
+      read -rp "Select option [0-9]: " choice
+    fi
+    case "$choice" in
+      1)
+        if [[ "$role" == "foreign" ]]; then create_foreign_tunnel; else import_peer_config; fi
+        read -rp "Press Enter to continue..." ;;
+      2) manage_tunnel; read -rp "Press Enter to continue..." ;;
+      3) status_all; read -rp "Press Enter to continue..." ;;
+      4) if choose_tunnel; then speed_test "$SELECTED_TUNNEL"; fi; read -rp "Press Enter to continue..." ;;
+      5) if choose_tunnel; then delete_tunnel "$SELECTED_TUNNEL"; fi; read -rp "Press Enter to continue..." ;;
+      6) bulk_startup_action enable; read -rp "Press Enter to continue..." ;;
+      7) bulk_startup_action disable; read -rp "Press Enter to continue..." ;;
+      8) if [[ "$role" == "foreign" ]]; then show_exports; else show_local_ips; fi; read -rp "Press Enter to continue..." ;;
+      9) select_role; read -rp "Press Enter to continue..." ;;
+      10) if [[ "$role" == "foreign" ]]; then import_peer_config; else warn "Invalid selection."; fi; read -rp "Press Enter to continue..." ;;
+      0) exit 0 ;;
+      *) warn "Invalid selection."; sleep 1 ;;
+    esac
+  done
+}
+
+main() {
+  require_root
+  ensure_dirs
+  require_commands
+  case "${1:-menu}" in
+    apply)
+      [[ -n "${2:-}" ]] || die "Tunnel name is required."
+      apply_tunnel "$2"
+      ;;
+    down)
+      [[ -n "${2:-}" ]] || die "Tunnel name is required."
+      down_tunnel "$2"
+      ;;
+    --version|-v)
+      echo "$APP_NAME $VERSION"
+      ;;
+    menu|"")
+      main_menu
+      ;;
+    *)
+      echo "Usage: $0 [menu|apply TUNNEL|down TUNNEL|--version]"
+      exit 2
+      ;;
+  esac
+}
+
+main "$@"

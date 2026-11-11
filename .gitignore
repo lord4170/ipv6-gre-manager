@@ -1,0 +1,26 @@
+# Runtime state and secrets
+*.conf
+*.secret
+*.password
+*.token
+*.key
+*.pem
+.env
+.env.*
+
+# Logs and temporary files
+*.log
+*.tmp
+*.swp
+*.swo
+*~
+
+# Python
+__pycache__/
+*.py[cod]
+
+# OS/editor metadata
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
