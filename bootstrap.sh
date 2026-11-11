@@ -6,8 +6,8 @@ umask 077
 #   curl -fsSL https://raw.githubusercontent.com/OWNER/REPO/main/bootstrap.sh \
 #     | sudo bash -s -- OWNER/REPO [BRANCH_OR_TAG]
 
-REPOSITORY="${1:-}"
-REF="${2:-main}"
+REPOSITORY="lord4170/ipv6-gre-manager"
+REF="${1:-main}"
 
 if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
   echo "[ERROR] Run this installer as root (use sudo)." >&2

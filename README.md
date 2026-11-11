@@ -65,16 +65,15 @@ The installer installs these packages through APT:
 
 The repository must be **public** for this no-token installation method.
 
-Replace `YOUR_GITHUB_USERNAME` with the GitHub account that owns this repository:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/YOUR_GITHUB_USERNAME/ipv6-gre-manager/main/bootstrap.sh | sudo bash -s -- YOUR_GITHUB_USERNAME/ipv6-gre-manager
+curl -fsSL https://raw.githubusercontent.com/lord4170/ipv6-gre-manager/main/bootstrap.sh | sudo bash -s -- lord4170/ipv6-gre-manager
 ```
 
 To install a specific tagged release instead of the latest `main` branch:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/YOUR_GITHUB_USERNAME/ipv6-gre-manager/main/bootstrap.sh | sudo bash -s -- YOUR_GITHUB_USERNAME/ipv6-gre-manager v1.0.3
+curl -fsSL https://raw.githubusercontent.com/lord4170/ipv6-gre-manager/main/bootstrap.sh | sudo bash -s -- lord4170/ipv6-gre-manager v1.0.3
 ```
 
 The command can be run from any directory on either server. The same command installs the manager on both the Foreign and Iran servers.
