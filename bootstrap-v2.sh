@@ -22,6 +22,8 @@ for file in gre-manager-v2.py.gz.b64 install-v2.sh; do
  curl --fail --location --silent --show-error --retry 3 "$BASE_URL/$file" --output "$TMP_DIR/$file"
 done
 base64 -d "$TMP_DIR/gre-manager-v2.py.gz.b64" | gzip -d > "$TMP_DIR/gre-manager-v2.py"
+# Normalize iproute2 tunnel-show syntax for portability.
+sed -i 's/ip -6 tunnel show dev /ip -6 tunnel show /g; s/"show", "dev", cfg\["ifname"\]/"show", cfg["ifname"]/g' "$TMP_DIR/gre-manager-v2.py"
 chmod 0755 "$TMP_DIR/install-v2.sh"
 bash "$TMP_DIR/install-v2.sh"
 echo "Start with: sudo gre-manager"
