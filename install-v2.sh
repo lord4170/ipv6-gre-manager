@@ -1,13 +1,12 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
-if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then echo "[ERROR] Run as root: sudo bash install-v2.sh" >&2; exit 1; fi
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+if [[ "$(id -u)" -ne 0 ]]; then echo "[ERROR] Run as root: sudo bash install-v2.sh" >&2; exit 1; fi
+SCRIPT_DIR="$(cd -- "$(dirname -- "$0")" && pwd)"
 SOURCE="$SCRIPT_DIR/gre-manager-v2.py"
 TARGET="/usr/local/sbin/gre-manager"
 [[ -f "$SOURCE" ]] || { echo "[ERROR] gre-manager-v2.py missing." >&2; exit 1; }
-[[ -r /etc/os-release ]] || { echo "[ERROR] Cannot identify OS." >&2; exit 1; }
 . /etc/os-release
-[[ "${ID:-}" == ubuntu ]] || { echo "[ERROR] Ubuntu required; detected ${PRETTY_NAME:-unknown}." >&2; exit 1; }
+[[ "$ID" == ubuntu ]] || { echo "[ERROR] Ubuntu required; detected $PRETTY_NAME." >&2; exit 1; }
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
 apt-get install -y iproute2 iputils-ping python3 ca-certificates
