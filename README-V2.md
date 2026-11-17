@@ -35,6 +35,9 @@ Menu options list local tunnel state and RX/TX counters, ping a selected peer, r
 - Pool: `10.250.0.0/16`, allocated as independent /30 networks.
 - Each peer gets a unique GRE key and Linux interface name.
 - The allocator checks current IPv4 addresses/routes plus existing registry allocations.
+- Before allocation, the Hub also scans common persistent network and script configuration paths (Netplan, systemd-networkd, ifupdown, NetworkManager, GRE Manager, and local admin scripts) for IPv4 reservations. Runtime kernel addresses and routes are checked as well.
+- The Hub displays the suggested free /30 and asks for confirmation. The operator can instead enter a custom canonical /30 network; it is checked against all discovered and registered networks before acceptance.
+- On import, the Iran Spoke independently checks the received /30 against its own active addresses/routes and common saved network configuration. If it conflicts, import is refused and a new Hub link with a different subnet is required.
 - Existing interfaces are never overwritten. Existing v1 files and unrelated GRE tunnels are not removed.
 - No default route, NAT, firewall, or IP forwarding changes are made.
 - Each local endpoint has its own systemd unit and is restored after reboot.
