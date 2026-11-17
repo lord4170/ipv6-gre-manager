@@ -48,6 +48,8 @@ def select6(prompt):
  if a not in xs:raise RuntimeError("Selected IPv6 is not assigned locally.")
  return a
 def networks():
+ # Check every address and route currently known to the Linux kernel, including
+ # interfaces that are administratively down and routes in non-main tables.
  out=[]
  for args,pat in [(["ip","-o","-4","addr","show"],r"inet (\d+\.\d+\.\d+\.\d+/\d+)"),(["ip","-4","route","show","table","all"],None)]:
   p=cmd(args,False)
@@ -59,7 +61,48 @@ def networks():
      t=l.split()[0]; n=None if t=="default" else ipaddress.ip_network(t,strict=False)
     if n:out.append(n)
    except:pass
- return out
+ # Also inspect common persistent network/script configuration locations.
+ # This catches reservations not yet applied to the running kernel.
+ roots=[Path("/etc/netplan"),Path("/etc/systemd/network"),Path("/etc/network"),
+        Path("/etc/NetworkManager/system-connections"),Path("/etc/gre-manager"),
+        Path("/usr/local/etc"),Path("/usr/local/sbin")]
+ pat=re.compile(r"(?<![0-9.])(?:\d{1,3}\.){3}\d{1,3}(?:/\d{1,2})?")
+ for rootpath in roots:
+  if not rootpath.exists():continue
+  files=[rootpath] if rootpath.is_file() else list(rootpath.rglob("*"))
+  for fp in files:
+   try:
+    if not fp.is_file() or fp.stat().st_size>2_000_000:continue
+    content=fp.read_text(errors="ignore")
+    for raw in pat.findall(content):
+     try:
+      # Bare IPv4 literals are treated as /32 reservations.
+      out.append(ipaddress.ip_network(raw if "/" in raw else raw+"/32",strict=False))
+     except:pass
+   except (OSError,PermissionError):pass
+ return list(dict.fromkeys(out))
+def choose_subnet(used):
+ suggested=next((n for n in POOL.subnets(new_prefix=30)
+                 if not any(n.overlaps(x) for x in used)),None)
+ if suggested is None:raise RuntimeError("No free /30 subnet remains in 10.250.0.0/16.")
+ while True:
+  answer=input(f"Suggested free tunnel subnet is {suggested}. Use it? [Y/n/custom]: ").strip().lower()
+  if answer in ("","y","yes"):candidate=suggested
+  elif answer in ("n","no","c","custom"):
+   raw=input("Enter a custom IPv4 /30 network (example: 10.250.0.0/30): ").strip()
+   try:candidate=ipaddress.ip_network(raw,strict=True)
+   except Exception:print("[ERROR] Invalid network or host bits set. Enter a canonical /30 network.");continue
+   if candidate.version!=4 or candidate.prefixlen!=30:
+    print("[ERROR] The tunnel network must be IPv4 /30.");continue
+   if any(candidate.overlaps(x) for x in used):
+    print(f"[ERROR] {candidate} overlaps an address, route, or configured reservation on this Hub server.");continue
+  else:
+   print("[ERROR] Enter Y, n, or custom.");continue
+  if any(candidate.overlaps(x) for x in used):
+   print(f"[ERROR] {candidate} is already in use on this Hub server.");continue
+  confirm=input(f"Confirm tunnel subnet {candidate}? [Y/n]: ").strip().lower()
+  if confirm in ("","y","yes"):return candidate
+  print("[INFO] Choose another subnet or retry the suggested subnet.")
 def apply(c):
  n=ifname(c["ifname"])
  if exists(n):raise RuntimeError("Interface "+n+" already exists; refusing to overwrite.")
@@ -111,8 +154,7 @@ def create():
   used=networks(); keys=set()
   for x in r["tunnels"]:
    used.append(ipaddress.ip_network(x["network"]));keys.add(int(x["key"]))
-  net=next((n for n in POOL.subnets(new_prefix=30) if not any(n.overlaps(x) for x in used)),None)
-  if net is None:raise RuntimeError("No free /30 subnet in 10.250.0.0/16.")
+  net=choose_subnet(used)
   key=next((k for k in (secrets.randbelow(2147483646)+1 for _ in range(100)) if k not in keys),None)
   if key is None:raise RuntimeError("Could not allocate unique GRE key.")
   hosts=list(net.hosts()); tid=uuid.uuid4().hex[:12]; iface="g6"+secrets.token_hex(5)
@@ -135,7 +177,9 @@ def import_peer():
  iface=ifname(input("Interface name ["+c["ifname"]+"]: ").strip() or c["ifname"])
  if exists(iface):raise RuntimeError("Interface already exists; refusing to overwrite.")
  net=ipaddress.ip_network(c["network"])
- if any(net.overlaps(x) for x in networks()):raise RuntimeError("Tunnel subnet overlaps an existing address or route.")
+ if any(net.overlaps(x) for x in networks()):
+  raise RuntimeError("The subnet in this Hub link overlaps an address, route, or saved network configuration on this Iran server. Do not import it. Re-create the peer on the Hub using a different free /30 subnet, then import the new link.")
+
  tid=c["id"];path=DATA/(tid+".json")
  if path.exists():raise RuntimeError("This tunnel ID is already imported.")
  localc={"id":tid,"name":name,"role":"iran","ifname":iface,"local6":c["iran6"],"remote6":c["hub6"],"key":c["key"],"network":str(net),"local4":c["iran4"],"peer4":c["hub4"],"mtu":c["mtu"]}
