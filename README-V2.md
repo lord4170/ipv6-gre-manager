@@ -1,53 +1,53 @@
-# IPv6 GRE Tunnel Manager v2 (Iran-first)
+# IPv6 GRE Tunnel Manager v2 (Hub-and-Spoke)
 
-**All terminal menus, prompts, status messages, and errors are in English.** The manager uses plain ASCII text in its terminal interface.
+**All terminal menus, prompts, status messages, and errors are English/ASCII only.**
 
-This version is developed on a separate branch. It does not replace the existing v1 manager or its configuration.
+This version is developed on the separate `v2-iran-first` branch. It does not replace v1 or modify its configuration.
+
+## Architecture
+
+The outside server is the central **Hub**. Each Iran server is an independent **Spoke**. One Hub can manage multiple Iran peers. Every peer receives its own interface, GRE key, tunnel ID, and non-overlapping IPv4 /30 subnet.
 
 ## Install
 
-Run this command on both Ubuntu servers:
+Run on both Ubuntu servers:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/lord4170/ipv6-gre-manager/v2-iran-first/bootstrap-v2.sh | sudo bash
-```
-
-Then launch:
-
-```bash
 sudo gre-manager
 ```
 
-## Menu
+## Workflow
 
-1. Create tunnel on the Iran server and generate a transfer link.
-2. Import the link on the outside server and create the peer tunnel.
-3. List registered tunnels and interface counters.
-4. Remove one selected tunnel.
-5. Run a ping test and show tunnel statistics.
-0. Exit.
+1. On the outside server, choose **Create Iran peer**.
+2. Enter a peer name and the Iran server's public IPv6 address; select the Hub's locally assigned global IPv6 address.
+3. The manager locks the central registry, rejects duplicate Iran IPv6 endpoints, checks local IPv4 addresses/routes and registered allocations, then allocates a free /30 subnet and unique GRE key.
+4. The Hub creates its tunnel and systemd unit, then prints a peer-specific transfer link.
+5. On the Iran server, choose **Import Hub link**, paste the link, select the matching local IPv6 address, and optionally set an interface name.
+6. The Spoke creates its matching endpoint and enables it at boot.
 
-## Setup workflow
+Menu options list local tunnel state and RX/TX counters, ping a selected peer, remove one local tunnel, and display the Hub registry.
 
-1. On the Iran server, select option 1 and enter the outside server's public IPv6 address. The manager detects the local IPv6 source, chooses an unused interface name, allocates an unused /30 subnet from 10.250.0.0/16, generates a unique GRE key, creates the tunnel, and displays the transfer link.
-2. On the outside server, select option 2, paste the link, and enter a preferred interface name.
-3. The outside server validates its local IPv6 address, creates the matching GRE tunnel, and tests connectivity to the Iran tunnel IP.
+## Allocation and safety
 
-Each tunnel has its own systemd unit and is restored after reboot.
+- Registry: `/etc/gre-manager/registry.json`; local configs: `/etc/gre-manager/tunnels/`.
+- Registry writes use an exclusive file lock and atomic replacement.
+- Pool: `10.250.0.0/16`, allocated as independent /30 networks.
+- Each peer gets a unique GRE key and Linux interface name.
+- The allocator checks current IPv4 addresses/routes plus existing registry allocations.
+- Existing interfaces are never overwritten. Existing v1 files and unrelated GRE tunnels are not removed.
+- No default route, NAT, firewall, or IP forwarding changes are made.
+- Each local endpoint has its own systemd unit and is restored after reboot.
+- Removing a Hub endpoint does not remotely delete the Iran endpoint; remove it separately on that peer.
 
 ## Transfer link security
 
-The GRE2 link contains Base64URL-encoded JSON and a truncated SHA-256 checksum. **It is not encrypted.** The checksum only detects accidental corruption; it is not a digital signature. Anyone who obtains the link can decode both IPv6 endpoints, tunnel IP addresses, and the GRE key. Treat the link as confidential.
-
-## Safety
-
-- Uses IPv6 GRE (IP protocol 47); no TCP or UDP port is used.
-- Does not change the default route, NAT, firewall rules, or IP forwarding.
-- Does not remove or modify existing tunnel interfaces or v1 configuration.
-- v2 configuration is stored under /etc/gre-manager/.
-- The executable is installed as /usr/local/sbin/gre-manager.
-- Removing a tunnel deletes only the selected local endpoint. Remove its peer separately if required.
+The link contains Base64URL-encoded JSON and a truncated SHA-256 checksum. **It is not encrypted.** The checksum detects accidental corruption only; it is not a signature. Anyone with the link can decode endpoint addresses and the GRE key. Keep it confidential.
 
 ## Requirements
 
-Ubuntu with systemd, root access, Python 3, iproute2, and IPv6 connectivity between both servers. The installer installs iproute2, iputils-ping, and Python 3 if needed. Allow IPv6 GRE (Next Header 47) in provider and host firewalls.
+Ubuntu with systemd, Python 3, iproute2, IPv6 connectivity, and root access. The installer installs iproute2, iputils-ping, and Python 3. IPv6 GRE uses IP protocol 47, not a TCP/UDP port; allow protocol 47 in provider and host firewalls.
+
+## Validation status
+
+Syntax and shell checks do not prove provider-level connectivity. End-to-end tunnel connectivity must be tested between real VPS endpoints.
