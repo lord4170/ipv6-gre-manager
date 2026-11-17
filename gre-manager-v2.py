@@ -84,25 +84,18 @@ def networks():
 def choose_subnet(used):
  suggested=next((n for n in POOL.subnets(new_prefix=30)
                  if not any(n.overlaps(x) for x in used)),None)
- if suggested is None:raise RuntimeError("No free /30 subnet remains in 10.250.0.0/16.")
+ if suggested is None:raise RuntimeError("No free /30 subnet in 10.250.0.0/16.")
  while True:
-  answer=input(f"Suggested free tunnel subnet is {suggested}. Use it? [Y/n/custom]: ").strip().lower()
-  if answer in ("","y","yes"):candidate=suggested
-  elif answer in ("n","no","c","custom"):
-   raw=input("Enter a custom IPv4 /30 network (example: 10.250.0.0/30): ").strip()
-   try:candidate=ipaddress.ip_network(raw,strict=True)
-   except Exception:print("[ERROR] Invalid network or host bits set. Enter a canonical /30 network.");continue
-   if candidate.version!=4 or candidate.prefixlen!=30:
-    print("[ERROR] The tunnel network must be IPv4 /30.");continue
-   if any(candidate.overlaps(x) for x in used):
-    print(f"[ERROR] {candidate} overlaps an address, route, or configured reservation on this Hub server.");continue
-  else:
-   print("[ERROR] Enter Y, n, or custom.");continue
+  raw=input(f"Enter Tunnel Subnet [{suggested}]: ").strip()
+  try:candidate=ipaddress.ip_network(raw or str(suggested),strict=True)
+  except Exception:
+   print("[ERROR] Invalid subnet.");continue
+  if candidate.version!=4 or candidate.prefixlen!=30:
+   print("[ERROR] Use an IPv4 /30 subnet.");continue
   if any(candidate.overlaps(x) for x in used):
-   print(f"[ERROR] {candidate} is already in use on this Hub server.");continue
-  confirm=input(f"Confirm tunnel subnet {candidate}? [Y/n]: ").strip().lower()
-  if confirm in ("","y","yes"):return candidate
-  print("[INFO] Choose another subnet or retry the suggested subnet.")
+   print("[ERROR] Subnet is already in use.");continue
+  return candidate
+
 def apply(c):
  n=ifname(c["ifname"])
  if exists(n):raise RuntimeError("Interface "+n+" already exists; refusing to overwrite.")
